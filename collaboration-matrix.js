@@ -1,8 +1,12 @@
 // Configuration
 const PERPLEXITY_API_KEY = 'your_key';
-const PERPLEXITY_API_URL = 'https://api.perplexity.ai/chat/completions';
-const ANTHROPIC_API_KEY = 'your_anthropic_key';
+const PERPLEXITY_API_URL = 'your_key';
+const ANTHROPIC_API_KEY = 'your_key';
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+
+// Add OpenAI configuration
+const OPENAI_API_KEY = 'your_key';
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
 // Column indices (1-based)
 const COLUMNS = {
@@ -38,8 +42,26 @@ function onOpen() {
     .createMenu('Company Analysis')
     .addItem('Populate Company Information', 'populateCompanyInfo')
     .addItem('Analyze Collaboration Opportunities', 'analyzeCollaborations')
+    .addItem('Analyze Collaboration Probability', 'analyzeCollaborationProbability')
+    .addSeparator()
+    .addItem('Reset Analysis Progress', 'resetAnalysisProgress')
+    .addItem('⚠️ Stop Running Scripts', 'stopScripts')
+    .addSeparator()
     .addItem('Clear Process Log', 'clearLog')
     .addToUi();
+}
+
+function stopScripts() {
+  const ui = SpreadsheetApp.getUi();
+  ui.alert(
+    '⚠️ Stop Scripts',
+    'To stop running scripts:\n\n' +
+    '1. Click the "Stop" button (■) in the toolbar\n' +
+    '2. Or press Ctrl + Alt + Shift + K (Windows)\n' +
+    '3. Or press Cmd + Option + Shift + K (Mac)\n\n' +
+    'After stopping, please wait a few seconds before running new scripts.',
+    ui.ButtonSet.OK
+  );
 }
 
 function clearLog() {
@@ -456,4 +478,229 @@ function getCompanyInformation(sheet) {
 // Helper function to check if a cell is empty (removing duplicate)
 function isEmpty(value) {
   return value === null || value === undefined || value === '';
+}
+
+function analyzeCollaborationProbability() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const matrixSheet = ss.getSheetByName('CollaborationMatrix');
+  const companyListSheet = ss.getSheetByName('List of companies');
+  
+  // Get progress from Properties Service
+  const scriptProperties = PropertiesService.getScriptProperties();
+  let startRow = parseInt(scriptProperties.getProperty('lastProcessedRow')) || 17;  // Start from row 17 if no saved progress
+  let startCol = parseInt(scriptProperties.getProperty('lastProcessedCol')) || 17;  // Start from column Q (17) if no saved progress
+  
+  logToSheet('Probability Analysis', 'Started', `Beginning collaboration probability analysis from cell: Column ${startCol}, Row ${startRow}`);
+  showProgress(`Starting collaboration probability analysis from position: Column ${startCol}, Row ${startRow}...`);
+  
+  // Get company information map
+  showProgress('Loading company information...');
+  const companyInfo = getCompanyInformation(companyListSheet);
+  
+  // Get the range of companies
+  const numCompanies = matrixSheet.getLastRow() - 1;
+  const totalPairs = (numCompanies * (numCompanies - 1)) / 2;
+  let processedPairs = 0;
+  let skippedPairs = 0;
+  let successCount = 0;
+  let errorCount = 0;
+  
+  // Get all existing values at once for better performance
+  const existingValues = matrixSheet.getRange(2, 2, numCompanies, numCompanies).getValues();
+  
+  logToSheet('Probability Analysis', 'In Progress', `Total pairs to check: ${totalPairs}`);
+  
+  // Process each cell in the matrix
+  for (let row = startRow; row <= numCompanies + 1; row++) {
+    for (let col = (row === startRow ? startCol : 2); col <= numCompanies + 1; col++) {
+      // Save current progress
+      scriptProperties.setProperties({
+        'lastProcessedRow': row.toString(),
+        'lastProcessedCol': col.toString()
+      });
+      
+      // Skip if companies are the same
+      if (row === col) {
+        continue;
+      }
+      
+      const company1 = matrixSheet.getRange(1, col).getValue();
+      const company2 = matrixSheet.getRange(row, 1).getValue();
+      
+      // Check if cell is empty
+      const existingValue = existingValues[row - 2][col - 2];
+      if (isEmpty(existingValue)) {
+        skippedPairs++;
+        processedPairs++;
+        showProgress(`Skipping ${company1} & ${company2} (no collaboration data) (${processedPairs}/${totalPairs})`);
+        continue;
+      }
+      
+      processedPairs++;
+      showProgress(`Analyzing probability for ${company1} & ${company2} (${processedPairs}/${totalPairs}, Skipped: ${skippedPairs})`);
+      
+      try {
+        const probability = analyzeCompanyPairProbability(
+          company1, 
+          company2, 
+          companyInfo[company1], 
+          companyInfo[company2],
+          existingValue
+        );
+        
+        // Color the cells based on probability
+        const color = getProbabilityColor(probability.score);
+        const cell = matrixSheet.getRange(row, col);
+        const symmetricCell = matrixSheet.getRange(col, row);
+        
+        // Update both cells (matrix is symmetric)
+        cell.setBackground(color)
+            .setNote(`Probability Score: ${probability.score}%\n\nReasoning: ${probability.reasoning}`);
+        symmetricCell.setBackground(color)
+                    .setNote(`Probability Score: ${probability.score}%\n\nReasoning: ${probability.reasoning}`);
+        
+        successCount++;
+        logToSheet('Probability Analysis', 'Success', `Completed ${company1} & ${company2} - Score: ${probability.score}%`);
+        
+        // Add delay to avoid rate limits
+        Utilities.sleep(1000);
+        
+        // Check if we're approaching the time limit (5 minutes)
+        if (processedPairs % 10 === 0) {  // Check every 10 pairs
+          if (new Date().getTime() - START_TIME > 4.5 * 60 * 1000) {  // 4.5 minutes
+            const pauseMessage = `Script paused due to time limit. Resume from: Column ${col}, Row ${row}`;
+            logToSheet('Probability Analysis', 'Paused', pauseMessage);
+            showProgress(pauseMessage);
+            return;  // Exit the function
+          }
+        }
+      } catch (error) {
+        errorCount++;
+        logToSheet('Probability Analysis', 'Error', `Failed ${company1} & ${company2}: ${error.message}`);
+        continue;
+      }
+    }
+  }
+  
+  // Clear progress when complete
+  scriptProperties.deleteProperty('lastProcessedRow');
+  scriptProperties.deleteProperty('lastProcessedCol');
+  
+  const finalMessage = `Probability Analysis Complete! Successful: ${successCount}, Skipped: ${skippedPairs}, Errors: ${errorCount}`;
+  showProgress(finalMessage);
+  logToSheet('Probability Analysis', 'Completed', finalMessage);
+}
+
+// Add this at the top of your file with other constants
+const START_TIME = new Date().getTime();
+
+// Add a function to reset progress if needed
+function resetAnalysisProgress() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  scriptProperties.deleteProperty('lastProcessedRow');
+  scriptProperties.deleteProperty('lastProcessedCol');
+  SpreadsheetApp.getActive().toast('Analysis progress has been reset', '✅ Reset Complete');
+}
+
+function analyzeCompanyPairProbability(company1, company2, info1, info2, existingCollaboration) {
+  // Validate company information
+  if (!info1 || !info2) {
+    throw new Error(`Missing company information for ${!info1 ? company1 : company2}`);
+  }
+
+  try {
+    const options = {
+      'method': 'post',
+      'headers': {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      'payload': JSON.stringify({
+        'model': 'o3-mini',
+        'messages': [
+          {
+            'role': 'system',
+            'content': 'You are a business and marketing strategy expert. Analyze collaboration potential between companies and provide: 1) A probability score (0-100), and 2) A brief explanation of the score. Keep responses concise.'
+          },
+          {
+            'role': 'user',
+            'content': `Analyze the probability of successful collaboration between these companies:
+
+Company 1: ${company1}
+Domain: ${info1.domain}
+Business Overview: ${info1.businessOverview}
+Target Audience: ${info1.targetAudience}
+Products: ${info1.products}
+
+Company 2: ${company2}
+Domain: ${info2.domain}
+Business Overview: ${info2.businessOverview}
+Target Audience: ${info2.targetAudience}
+Products: ${info2.products}
+
+Proposed Collaboration:
+${existingCollaboration}
+
+Provide:
+1. A probability score (0-100) for collaboration success
+2. A brief explanation (max 100 words) of the score
+
+Consider:
+- Market alignment
+- Product complementarity
+- Target audience overlap
+- Technical feasibility
+- Potential conflicts
+- Market timing
+
+Format your response as:
+Score: [number]
+Reasoning: [explanation]`
+          }
+        ]
+      }),
+      'muteHttpExceptions': true
+    };
+
+    const response = UrlFetchApp.fetch(OPENAI_API_URL, options);
+    const jsonResponse = JSON.parse(response.getContentText());
+    
+    // Log the raw response for debugging
+    logToSheet('API Response', 'Debug', `Raw OpenAI response for ${company1} & ${company2}: ${JSON.stringify(jsonResponse)}`);
+    
+    if (!jsonResponse.choices || !jsonResponse.choices[0] || !jsonResponse.choices[0].message) {
+      throw new Error('Invalid API response format');
+    }
+    
+    const content = jsonResponse.choices[0].message.content;
+    
+    // Extract score and reasoning from the text response
+    const scoreMatch = content.match(/Score:\s*(\d+)/i);
+    const reasoningMatch = content.match(/Reasoning:\s*([^\n]+)/i);
+    
+    if (!scoreMatch || !reasoningMatch) {
+      throw new Error('Could not extract score or reasoning from response');
+    }
+    
+    const score = Math.min(100, Math.max(0, Number(scoreMatch[1])));
+    const reasoning = reasoningMatch[1].trim();
+    
+    return {
+      score: score,
+      reasoning: reasoning
+    };
+  } catch (error) {
+    logToSheet('API Error', 'Error', `Failed to analyze ${company1} & ${company2}: ${error.message}\nResponse content: ${jsonResponse?.choices?.[0]?.message?.content || 'No content'}`);
+    throw new Error(`Failed to analyze probability: ${error.message}`);
+  }
+}
+
+function getProbabilityColor(score) {
+  if (score >= 70) {
+    return '#b7e1cd'; // Light green
+  } else if (score >= 40) {
+    return '#fff2cc'; // Light yellow
+  } else {
+    return '#f4c7c3'; // Light red
+  }
 }
